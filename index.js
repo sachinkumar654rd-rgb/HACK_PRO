@@ -1,0 +1,164 @@
+const { Telegraf, Input } = require('telegraf');
+const axios = require('axios');
+const express = require('express');
+const fs = require('fs');
+const { initializeApp, getApps, getApp } = require('firebase/app');
+const { 
+    getFirestore, doc, setDoc, getDocs, 
+    collection, query, limit, getDoc, orderBy 
+} = require('firebase/firestore');
+
+// --- Config ---
+const BOT_TOKEN = '8778650117:AAHTh9KfXmiWHdNoBgyYsocF_7HYWT4HoqU';
+const CHANNEL_ID = '-1003745287823'; 
+const APP_ID = "prediction-hpro-64253";
+const ALT_API_URL = "https://api.tirangagames.com/api/webapi/GetNoaverageEmerdList"; 
+
+const firebaseConfig = {
+  apiKey: "AIzaSyD3d40JbKJWDv2c0OoHJ2oy6Uo0zMdD63o",
+  authDomain: "prediction-64253.firebaseapp.com",
+  projectId: "prediction-64253",
+  storageBucket: "prediction-64253.firebasestorage.app",
+  messagingSenderId: "26921730315",
+  appId: "1:26921730315:web:216e1551fc97184498a20e"
+};
+
+const firebaseApp = !getApps().length ? initializeApp(firebaseConfig) : getApp();
+const db = getFirestore(firebaseApp);
+const bot = new Telegraf(BOT_TOKEN);
+
+/**
+ * Sync logic
+ */
+async function syncData() {
+    try {
+        const res = await axios.post(ALT_API_URL, {
+            pageSize: 20, pageNo: 1, typeid: 1, language: 0
+        }, { timeout: 10000 });
+        if (res.data?.data?.list) return res.data.data.list;
+    } catch (e) { return null; }
+}
+
+/**
+ * AI Sequence Engine
+ */
+async function getPrediction(latestNums) {
+    const snap = await getDocs(collection(db, 'artifacts', APP_ID, 'public', 'data', 'history'));
+    let history = [];
+    snap.forEach(d => history.push(d.data()));
+    history.sort((a, b) => Number(b.period) - Number(a.period));
+    const hNums = history.map(h => h.number);
+
+    if (hNums.length < 15) return { r: "WAIT", l: 0, dbSize: hNums.length };
+
+    for (let L = 10; L >= 2; L--) {
+        const pattern = latestNums.slice(0, L);
+        let found = [];
+        for (let i = 1; i < hNums.length - L; i++) {
+            let match = true;
+            for (let j = 0; j < L; j++) { if (hNums[i + j] !== pattern[j]) { match = false; break; } }
+            if (match) found.push(hNums[i - 1]);
+        }
+        if (found.length > 0) {
+            const counts = {};
+            found.forEach(x => counts[x] = (counts[x] || 0) + 1);
+            const most = Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b);
+            return { r: parseInt(most) >= 5 ? "BIG" : "SMALL", l: L, dbSize: hNums.length };
+        }
+    }
+    return { r: Math.random() > 0.5 ? "BIG" : "SMALL", l: "AI", dbSize: hNums.length };
+}
+
+// --- COMMANDS ---
+
+bot.command('history', async (ctx) => {
+    try {
+        await ctx.reply("⏳ Database se history nikal raha hoon, thoda intezar karein...");
+        
+        const snap = await getDocs(collection(db, 'artifacts', APP_ID, 'public', 'data', 'history'));
+        let history = [];
+        snap.forEach(d => history.push(d.data()));
+        
+        // Sorting: Sabse taza upar (Newest to Oldest)
+        history.sort((a, b) => Number(b.period) - Number(a.period));
+
+        let fileContent = "🆔 PERIOD | 🎯 RESULT | 📊 SIZE\n";
+        fileContent += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+        
+        history.forEach(h => {
+            const size = h.number >= 5 ? "BIG" : "SMALL";
+            fileContent += `${h.period}  |    ${h.number}     |  ${size}\n`;
+        });
+
+        const fileName = `history_${Date.now()}.txt`;
+        fs.writeFileSync(fileName, fileContent);
+
+        await ctx.replyWithDocument(Input.fromLocalFile(fileName, 'Full_History.txt'), {
+            caption: `✅ Total Records: ${history.length}\nDatabase se puri history nikal li gayi hai.`
+        });
+
+        // Cleanup file
+        fs.unlinkSync(fileName);
+    } catch (e) {
+        ctx.reply("❌ Error: History file banane mein samasya hui.");
+        console.error(e);
+    }
+});
+
+bot.start((ctx) => ctx.reply("System Online. Prediction channel mein post ho rahi hai. Puri history ke liye /history type karein."));
+
+// --- AUTO LOOP ---
+let lastP = "";
+
+async function loop() {
+    const list = await syncData();
+    if (!list) return;
+
+    const top = list[0];
+    const cur = top.issueNumber || top.period;
+    const nxt = (BigInt(cur) + 1n).toString();
+
+    // Sync to Firebase
+    for (let item of list.slice(0, 5)) {
+        const id = item.issueNumber || item.period;
+        const num = item.number || item.result;
+        await setDoc(doc(db, 'artifacts', APP_ID, 'public', 'data', 'history', id), {
+            period: id, number: parseInt(num), time: Date.now()
+        }, { merge: true });
+    }
+
+    const stRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'last_pred', 'state');
+    const stSnap = await getDoc(stRef);
+
+    if (stSnap.exists()) {
+        const d = stSnap.data();
+        if (d.issueNumber === cur && !d.done) {
+            const actNum = parseInt(top.number || top.result);
+            const actSz = actNum >= 5 ? "BIG" : "SMALL";
+            const updateMsg = `🎯 *RESULT UPDATE*\n━━━━━━━━━━━━━━\n🆔 *Period:* \`#${cur.slice(-4)}\`\n🎲 *Pred:* ${d.prediction}\n🎯 *Res:* ${actSz} (${actNum})\n📊 *Status:* ${d.prediction === actSz ? "✅ WIN" : "❌ LOSS"}\n✨ *Matched:* L-${d.level}`;
+            try {
+                await bot.telegram.editMessageText(CHANNEL_ID, d.msgId, null, updateMsg, { parse_mode: 'Markdown' });
+                await setDoc(stRef, { done: true }, { merge: true });
+            } catch (e) {}
+        }
+    }
+
+    if (lastP !== cur) {
+        lastP = cur;
+        const seq = list.slice(0, 10).map(x => parseInt(x.number || x.result));
+        const ai = await getPrediction(seq);
+        const msg = `🎯 *HACK BRO PRO*\n━━━━━━━━━━━━━━\n🆔 *Period:* \`#${nxt.slice(-4)}\`\n🎲 *Prediction:* **${ai.r}**\n📊 *Match:* L-${ai.l}\n⏳ *Status:* Live Tracking...\n━━━━━━━━━━━━━━\nRecords: \`${ai.dbSize}\``;
+        try {
+            const s = await bot.telegram.sendMessage(CHANNEL_ID, msg, { parse_mode: 'Markdown' });
+            await setDoc(stRef, { issueNumber: nxt, prediction: ai.r, level: ai.l, msgId: s.message_id, done: false });
+        } catch (e) {}
+    }
+}
+
+const app = express();
+app.get('/', (req, res) => res.send('AI History Engine Running'));
+app.listen(process.env.PORT || 3000);
+
+setInterval(loop, 30000);
+loop();
+bot.launch();
